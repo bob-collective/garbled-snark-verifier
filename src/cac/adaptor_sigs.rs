@@ -155,7 +155,7 @@ mod tests {
 
     use super::*;
 
-    fn fr_from_sk(sk: &SigningKey) -> Fr {
+    pub fn fr_from_sk(sk: &SigningKey) -> Fr {
         let bytes = sk.to_bytes();
         fr_from_be_bytes_mod_order(bytes.as_slice())
     }
@@ -246,10 +246,13 @@ mod bitvm_tests {
         transaction::Version,
     };
     use bitcoin_script::script;
+    use itertools::Itertools;
     use k256::{
         elliptic_curve::point::AffineCoordinates,
         schnorr::{Signature as KSig, SigningKey, VerifyingKey},
     };
+
+    use crate::cac::adaptor_sigs::tests::fr_from_sk;
 
     use super::*;
 
@@ -359,17 +362,17 @@ mod bitvm_tests {
         assert!(res.success);
     }
 
-    #[test]
-    fn test_tx_multiple_sigs() {
-        let evaluator_privkey = SigningKey::random(&mut rand::thread_rng());
-        let evaluator_pubkey = evaluator_privkey.verifying_key().as_affine().x().to_vec();
-        let mut rng = rand::thread_rng();
+    fn script_for(secret: Fr, num_sigs: usize) -> ScriptBuf {
+        let pubkey = Projective::generator() * secret;
+        let pubkey_bytes = pubkey
+            .into_affine()
+            .x()
+            .unwrap()
+            .into_bigint()
+            .to_bytes_be();
 
-        let num_sigs = 3;
-
-        // assumes num_sigs >= 2
-        let script = script! {
-            { evaluator_pubkey.clone() }
+        script! {
+            { pubkey_bytes }
 
             for _ in 0..num_sigs - 1 {
                 OP_TUCK
@@ -379,36 +382,21 @@ mod bitvm_tests {
 
             OP_CHECKSIG
         }
-        .compile();
+        .compile()
+    }
 
-        let spend_info = spend_info_from_script(script.clone());
-        let address = address_from_spend_info(&spend_info, Network::Testnet);
-        let mut tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn::default()],
-            output: vec![TxOut {
-                value: Amount::from_sat(2000),
-                script_pubkey: address.script_pubkey(),
-            }],
-        };
+    fn sighashes(
+        tx: &Transaction,
+        prevouts: &[TxOut],
+        script: &ScriptBuf,
+        num_sigs: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut sighash_cache = SighashCache::new(tx);
 
-        // Provide a concrete prevout matching the spend script to compute taproot sighash
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(2000),
-            script_pubkey: address.script_pubkey(),
-        }];
-        let mut sighash_cache = SighashCache::new(&tx);
-
-        let sigs = (0..num_sigs)
+        (0..num_sigs as u32)
             .map(|i| {
-                let evaluator_secret_fr =
-                    fr_from_be_bytes_mod_order(evaluator_privkey.to_bytes().as_slice());
-
-                let garbler_secret_fr = Fr::rand(&mut rng);
-                let garbler_commit = Projective::generator() * garbler_secret_fr;
-
                 let mut enc = TapSighash::engine();
+
                 sighash_cache
                     .taproot_encode_signing_data_to(
                         &mut enc,
@@ -422,30 +410,57 @@ mod bitvm_tests {
                         TapSighashType::Default,
                     )
                     .unwrap();
-                let sighash = TapSighash::from_engine(enc).to_byte_array().to_vec();
-
-                let adaptor = AdaptorInfo::new(
-                    &evaluator_secret_fr,
-                    garbler_commit,
-                    sighash.as_slice(),
-                    &mut rng,
-                );
-
-                let garbler_sig_bytes = adaptor.garbler_signature(&garbler_secret_fr);
-                // Verify using k256 in test only
-                let verifying_key: VerifyingKey = *evaluator_privkey.verifying_key();
-                let ksig = KSig::try_from(garbler_sig_bytes.as_slice()).expect("valid sig");
-                verifying_key
-                    .verify_raw(sighash.as_slice(), &ksig)
-                    .expect("signature should be valid");
-
-                let secret = adaptor
-                    .extract_secret(&garbler_sig_bytes)
-                    .expect("secret should be extracted");
-                assert_eq!(secret, garbler_secret_fr);
-                garbler_sig_bytes.to_vec()
+                TapSighash::from_engine(enc).to_byte_array().to_vec()
             })
-            .collect::<Vec<_>>();
+            .collect_vec()
+    }
+
+    #[test]
+    fn test_tx_multiple_sigs() {
+        let mut rng = rand::thread_rng();
+        let evaluator_privkey_fr = Fr::from_be_bytes_mod_order(&SigningKey::random(&mut rand::thread_rng()).to_bytes());
+        // let evaluator_privkey_fr = fr_from_sk(&evaluator_privkey);
+        let evaluator_pubkey2 = (Projective::generator() * evaluator_privkey_fr)
+        .into_affine()
+        .x()
+        .unwrap()
+        .into_bigint()
+        .to_bytes_be();
+
+
+        let num_sigs = 3;
+
+        // assumes num_sigs >= 2
+        let script = script_for(evaluator_privkey_fr, num_sigs);
+
+        let spend_info = spend_info_from_script(script.clone());
+        let address = address_from_spend_info(&spend_info, Network::Testnet);
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(2000),
+                script_pubkey: ScriptBuf::new_p2a(),
+            }],
+        };
+
+        // Provide a concrete prevout matching the spend script to compute taproot sighash
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(2000),
+            script_pubkey: address.script_pubkey(),
+        }];
+
+        let sighashes = sighashes(&tx, &prevouts, &script, num_sigs);
+
+        let garbler_secrets = (0..num_sigs).map(|_|  Fr::rand(&mut rng)).collect_vec();
+        let garbler_commits = crate::cac::vsss::Secp256k1::new().generator_batch_mul(&garbler_secrets);
+    
+        let adaptor_infos = garbler_commits.iter().zip_eq(sighashes).map(|(commit, sighash)| 
+            AdaptorInfo::new(&evaluator_privkey_fr, commit.clone(), &sighash, &mut rng))
+            .collect_vec();
+        let sigs = garbler_secrets.iter().zip_eq(adaptor_infos.iter()).map(|(garbler_secret, info)|
+        info.garbler_signature(garbler_secret).to_vec()).collect_vec();
 
         let control_block = spend_info
             .control_block(&(script.clone(), LeafVersion::TapScript))

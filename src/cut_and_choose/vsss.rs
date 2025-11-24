@@ -1,12 +1,14 @@
 use std::thread::JoinHandle;
 
-use ark_ff::UniformRand;
+use ark_ec::{CurveGroup, PrimeGroup};
+use ark_ff::{BigInteger, PrimeField, UniformRand};
 use ark_secp256k1::{Fr, Projective};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use crossbeam::channel;
 use itertools::Itertools;
 use rand::Rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use tracing::info;
 
 use crate::{
     AesNiHasher, CommitPhaseOne, EvaluatedWire, LabelCommitHasher, S, WireId,
@@ -167,6 +169,7 @@ pub struct EvaluatorAdaptorSigs {
 impl EvaluatorAdaptorSigs {
     pub fn new(
         rng: &mut impl Rng,
+        secret: Fr,
         finalized_indices: &[usize],
         garbler_commits: &[ShareCommits<Canonical<Projective>>],
         sighashes: &[Vec<u8>],
@@ -174,7 +177,6 @@ impl EvaluatorAdaptorSigs {
         // choose an index that is to be used for the assert
         let assert_index = finalized_indices[rng.gen_range(0..finalized_indices.len())];
 
-        let secret = Fr::rand(rng);
         let adaptor_sigs = garbler_commits
             .chunks(256)
             .zip_eq(sighashes)
@@ -279,5 +281,25 @@ impl EvaluatorAdaptorSigs {
                 (index, wires)
             })
             .collect_vec()
+    }
+}
+
+pub fn rand_schnorr_sk(rng: &mut impl Rng) -> Fr {
+    let ret = loop {
+        let ret = Fr::rand(rng);
+        if !ret.into_bigint().is_zero() {
+            break ret;
+        }
+    };
+    let is_odd = (Projective::generator() * ret)
+    .into_affine()
+        .y
+        .into_bigint()
+        .is_odd();
+
+    if is_odd {
+        -ret
+    } else {
+        ret
     }
 }
